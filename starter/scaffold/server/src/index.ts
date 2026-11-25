@@ -5,9 +5,133 @@ import { createServer } from 'node:http';
 import { config } from './config.js';
 import { getDb } from './db.js';
 import { randomUUID } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
+import { getRedis } from './redis.js';
+import { WebSocketServer, WebSocket } from 'ws';
 
 const app = express();
 const server = createServer(app);
+
+
+const wss = new WebSocketServer({ noServer: true });
+const redisPub = getRedis();
+const redisSub = redisPub.duplicate();
+
+server.on('upgrade', async (req, socket, head) => {
+  try {
+    const url = new URL(req.url || '/', 'http://localhost');
+    if (url.pathname !== '/ws') {
+      socket.destroy();
+      return;
+    }
+
+    const sid = readCookieFromHeader(req.headers.cookie, 'switchboard_session');
+    if (!sid) {
+      socket.destroy();
+      return;
+    }
+
+    const raw = await redisPub.get(`session:${sid}`);
+    if (!raw) {
+      socket.destroy();
+      return;
+    }
+
+    const user = JSON.parse(raw);
+    const workspace = url.searchParams.get('workspace') || '';
+    const member = user.workspaces?.some((w: any) => w.id === workspace);
+
+    if (!member) {
+      socket.destroy();
+      return;
+    }
+
+    wss.handleUpgrade(req, socket, head, ws => {
+      wss.emit('connection', ws, req, { workspace, after: Number(url.searchParams.get('after') || 0) });
+    });
+  } catch {
+    socket.destroy();
+  }
+});
+
+function readCookieFromHeader(header = '', name: string) {
+  const item = header.split(';').map(v => v.trim())
+    .find(v => v.startsWith(name + '='));
+  return item ? decodeURIComponent(item.slice(name.length + 1)) : undefined;
+}
+
+wss.on('connection', async (ws: WebSocket, _req: express.Request, info: any) => {
+  const { workspace, after } = info;
+  const channel = `switchboard:live:${workspace}`;
+  const buffer: any[] = [];
+  let replaying = true;
+  let lastSeq = after;
+
+  const send = (frame: any) => {
+    if (ws.readyState === WebSocket.OPEN && frame.seq > lastSeq) {
+      ws.send(JSON.stringify(frame));
+      lastSeq = frame.seq;
+    }
+  };
+
+  const subscriber = redisPub.duplicate();
+
+  const onMessage = (message: string) => {
+    try {
+      const frame = JSON.parse(message);
+      if (replaying) buffer.push(frame);
+      else send(frame);
+    } catch {}
+  };
+
+  subscriber.on('message', (_channel, message) => onMessage(message));
+
+  try {
+    await subscriber.subscribe(channel);
+
+    const history = await redisPub.zrange(
+      `switchboard:history:${workspace}`,
+      '0',
+      '-1'
+    );
+
+    for (const item of history) {
+      const frame = JSON.parse(item);
+      if (frame.seq > after) send(frame);
+    }
+
+    replaying = false;
+    buffer.sort((a, b) => a.seq - b.seq);
+    for (const frame of buffer) send(frame);
+  } catch (err) {
+    console.error('WebSocket replay failed:', err);
+    ws.close();
+  }
+
+  ws.on('close', () => {
+    subscriber.unsubscribe(channel).catch(() => {});
+    subscriber.disconnect();
+  });
+});
+
+async function broadcastInbound(workspace: string, message: any) {
+  const seq = await redisPub.incr(`switchboard:seq:${workspace}`);
+
+  const frame = {
+    type: 'message.inbound',
+    seq,
+    workspace,
+    message_id: message.messageId,
+    contact: message.contact,
+    text: message.text,
+  };
+
+  const history = `switchboard:history:${workspace}`;
+  await redisPub.zadd(history, seq, JSON.stringify(frame));
+  await redisPub.zremrangebyrank(history, 0, -1001);
+  await redisPub.publish(`switchboard:live:${workspace}`, JSON.stringify(frame));
+}
+
 
 const WORKSPACES = ['ws_acme', 'ws_globex'];
 const knownWorkspace = (ws: string) => WORKSPACES.includes(ws);
@@ -88,6 +212,7 @@ app.post(
             typeof from !== 'string') {
           return res.sendStatus(200);
         }
+        
 
         await db.collection('inbound_messages').updateOne(
           { workspace: event.workspace, messageId: message_id },
@@ -117,6 +242,11 @@ app.post(
           },
           { upsert: true }
         );
+        await broadcastInbound(event.workspace, {
+  messageId: message_id,
+  contact: from,
+  text: String(text ?? ''),
+});
       }
 
       if (event.type === 'message.status') {
@@ -137,6 +267,161 @@ app.post(
     }
   }
 );
+
+
+
+const redis = getRedis();
+
+function readCookie(req: express.Request, name: string): string | undefined {
+  const header = req.headers.cookie || '';
+  const item = header.split(';').map(v => v.trim())
+    .find(v => v.startsWith(name + '='));
+  return item ? decodeURIComponent(item.slice(name.length + 1)) : undefined;
+}
+
+async function getSession(req: express.Request): Promise<any | null> {
+  const sid = readCookie(req, 'switchboard_session');
+  if (!sid) return null;
+  const raw = await redis.get(`session:${sid}`);
+  if (!raw) return null;
+  return JSON.parse(raw);
+}
+
+app.get('/auth/login', async (_req, res) => {
+  try {
+    const state = randomBytes(24).toString('hex');
+    const nonce = randomBytes(24).toString('hex');
+    const verifier = randomBytes(32).toString('base64url');
+    const challenge = createHash('sha256').update(verifier).digest('base64url');
+
+    await redis.set(
+      `oidc:${state}`,
+      JSON.stringify({ verifier, nonce }),
+      'EX',
+      300
+    );
+
+    const url = new URL('/authorize', config.oidc.issuer);
+    url.search = new URLSearchParams({
+      response_type: 'code',
+      client_id: config.oidc.clientId,
+      redirect_uri: config.oidc.redirectUri,
+      scope: 'openid profile email',
+      state,
+      nonce,
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+    }).toString();
+
+    res.redirect(302, url.toString());
+  } catch (err) {
+    console.error('Login start failed:', err);
+    res.sendStatus(503);
+  }
+});
+
+app.get('/auth/callback', async (req, res) => {
+  try {
+    const code = String(req.query.code || '');
+    const state = String(req.query.state || '');
+    if (!code || !state) return res.sendStatus(400);
+
+    const raw = await redis.get(`oidc:${state}`);
+    if (!raw) return res.sendStatus(401);
+    await redis.del(`oidc:${state}`);
+
+    const pending = JSON.parse(raw);
+
+    const tokenResponse = await fetch(`${config.oidc.issuer}/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: config.oidc.redirectUri,
+        client_id: config.oidc.clientId,
+        client_secret: config.oidc.clientSecret,
+        code_verifier: pending.verifier,
+      }),
+    });
+
+    if (!tokenResponse.ok) {
+      console.error('OIDC token exchange failed:', await tokenResponse.text());
+      return res.sendStatus(401);
+    }
+
+    const tokens: any = await tokenResponse.json();
+
+    const userResponse = await fetch(`${config.oidc.issuer}/userinfo`, {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    });
+
+    if (!userResponse.ok) return res.sendStatus(401);
+
+    const user: any = await userResponse.json();
+    if (!user.sub || !Array.isArray(user.workspaces)) {
+      return res.sendStatus(401);
+    }
+
+    const sid = randomBytes(32).toString('hex');
+    await redis.set(
+      `session:${sid}`,
+      JSON.stringify({
+        sub: user.sub,
+        name: user.name,
+        email: user.email,
+        workspaces: user.workspaces,
+      }),
+      'EX',
+      86400
+    );
+
+    res.setHeader(
+      'Set-Cookie',
+      `switchboard_session=${sid}; HttpOnly; Path=/; SameSite=Lax; Max-Age=86400`
+    );
+    res.redirect(302, config.webOrigin);
+  } catch (err) {
+    console.error('OIDC callback failed:', err);
+    res.sendStatus(500);
+  }
+});
+
+app.get('/api/me', async (req, res) => {
+  try {
+    const user = await getSession(req);
+    if (!user) return res.sendStatus(401);
+    res.json(user);
+  } catch {
+    res.sendStatus(401);
+  }
+});
+
+app.get('/api/conversations', async (req, res) => {
+  try {
+    const user = await getSession(req);
+    if (!user) return res.sendStatus(401);
+
+    const workspace = String(req.query.workspace || '');
+    const membership = user.workspaces.find(
+      (w: any) => w.id === workspace
+    );
+    if (!membership) return res.sendStatus(403);
+
+    const db = await getDb();
+    const conversations = await db.collection('conversations')
+      .find({ workspace })
+      .sort({ updatedAt: -1 })
+      .limit(100)
+      .toArray();
+
+    res.json({ conversations });
+  } catch (err) {
+    console.error('Conversation list failed:', err);
+    res.sendStatus(500);
+  }
+});
+
 
 app.use(express.json());
 
