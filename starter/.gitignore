@@ -3,3 +3,8 @@ dist/
 .env
 .check-logs/
 dump.rdb
+node_modules/
+.env
+.check-logs/
+dist/
+coverage/
