@@ -4,6 +4,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { config } from './config.js';
 import { getDb } from './db.js';
+import { randomUUID } from 'node:crypto';
 
 const app = express();
 const server = createServer(app);
@@ -147,6 +148,63 @@ app.use('/__grader', (req, res, next) => {
   next();
 });
 
+
+app.post('/__grader/reply', async (req, res) => {
+  try {
+    const { workspace, contact, text, client_ref } = req.body || {};
+
+    if (
+      !knownWorkspace(workspace) ||
+      typeof contact !== 'string' ||
+      typeof text !== 'string' ||
+      !text.trim() ||
+      typeof client_ref !== 'string' ||
+      !client_ref
+    ) {
+      return res.sendStatus(400);
+    }
+
+    const db = await getDb();
+    const messages = db.collection('outbound_messages');
+
+    // Atomically reserve this client_ref. Concurrent retries share one record.
+    try {
+      await messages.insertOne({
+        workspace,
+        contact,
+        text,
+        clientRef: client_ref,
+        status: 'queued',
+        nextAttemptAt: new Date(),
+        createdAt: new Date(),
+      });
+    } catch (err: any) {
+      if (err?.code !== 11000) throw err;
+    }
+
+    await db.collection('conversations').updateOne(
+      { workspace, contact },
+      {
+        $setOnInsert: {
+          workspace,
+          contact,
+          assignee: null,
+          status: 'open',
+          createdAt: new Date(),
+        },
+        $set: { updatedAt: new Date() },
+      },
+      { upsert: true }
+    );
+
+    return res.sendStatus(202);
+  } catch (err) {
+    console.error('Reply enqueue failed:', err);
+    return res.sendStatus(503);
+  }
+});
+
+
 app.post('/__grader/reset', async (_req, res) => {
   try {
     const db = await getDb();
@@ -249,6 +307,111 @@ app.post('/__grader/claim', async (req, res) => {
     return res.sendStatus(500);
   }
 });
+
+
+async function deliverReplies() {
+  const db = await getDb();
+  const collection = db.collection('outbound_messages');
+
+  // Process one eligible reply at a time. The conditional update
+  // prevents two server instances from taking the same queued item.
+  const candidate = await collection.findOne({
+    status: 'queued',
+    nextAttemptAt: { $lte: new Date() },
+  });
+
+  if (!candidate) return;
+
+  const lockToken = randomUUID();
+  const claimed = await collection.updateOne(
+    {
+      _id: candidate._id,
+      status: 'queued',
+      nextAttemptAt: candidate.nextAttemptAt,
+    },
+    {
+      $set: {
+        lockToken,
+        lockedAt: new Date(),
+      },
+    }
+  );
+
+  if (!claimed.modifiedCount) return;
+
+  const message = await collection.findOne({
+    _id: candidate._id,
+    lockToken,
+  });
+
+  if (!message) return;
+
+  const apiKey = config.pigeon.apiKeys[message.workspace];
+
+  try {
+    const response = await fetch(`${config.pigeon.url}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'Idempotency-Key': message.clientRef,
+      },
+      body: JSON.stringify({
+        to: message.contact,
+        text: message.text,
+        client_ref: message.clientRef,
+      }),
+    });
+
+    if (response.ok) {
+      await collection.updateOne(
+        { _id: message._id, lockToken },
+        {
+          $set: {
+            deliveryRequested: true,
+            deliveryRequestedAt: new Date(),
+          },
+          $unset: { lockToken: '', lockedAt: '', nextAttemptAt: '' },
+        }
+      );
+      return;
+    }
+
+    const retryAfter = Number(response.headers.get('retry-after'));
+    const delay = response.status === 429 && Number.isFinite(retryAfter) && retryAfter > 0
+      ? retryAfter * 1000
+      : 3000;
+
+    await collection.updateOne(
+      { _id: message._id, lockToken },
+      {
+        $set: {
+          nextAttemptAt: new Date(Date.now() + delay),
+          lastError: `Pigeon HTTP ${response.status}`,
+        },
+        $unset: { lockToken: '', lockedAt: '' },
+      }
+    );
+  } catch (error) {
+    await collection.updateOne(
+      { _id: message._id, lockToken },
+      {
+        $set: {
+          nextAttemptAt: new Date(Date.now() + 3000),
+          lastError: String(error),
+        },
+        $unset: { lockToken: '', lockedAt: '' },
+      }
+    );
+  }
+}
+
+setInterval(() => {
+  deliverReplies().catch(error =>
+    console.error('Reply worker error:', error)
+  );
+}, 200);
+
 
 server.listen(config.port, async () => {
   try {
